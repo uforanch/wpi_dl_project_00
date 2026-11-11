@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsert-mae"
+version = "0.1.0"
+description = "Event + thermal cross-modal masked autoencoder pretraining on DSERT-RoLL, evaluated by label-efficient 2D detection"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    # On a GPU machine, install the CUDA build of torch/torchvision FIRST
+    # (command from pytorch.org); pip will then keep it instead of pulling
+    # the default build.
+    "torch>=1.11",              # F.interpolate(antialias=True)
+    "torchvision>=0.13",        # ResNet18_Weights API, FCOS
+    "numpy>=1.20",
+    "pillow>=8.0",
+    "matplotlib>=3.3",          # inspect / overlap figures, plot
+    "huggingface_hub>=0.14",    # HfFileSystem, used by the `cache` command
+    "transformers>=4.46.3",
+]
+
+[project.scripts]
+# After `pip install -e .`, run e.g. `dsert-exp inspect` instead of
+# `python run_experiments.py inspect`.
+dsert-exp = "run_experiments:main"
+
+[tool.setuptools]
+# Flat layout: the three scripts are top-level modules, not a package.
+py-modules = ["run_experiments", "event_dense_ae", "dsert_stream"]
