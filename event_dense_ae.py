@@ -188,18 +188,24 @@ class FusedBackbone(nn.Module):
     FCOS expects one image tensor, so event and dense channels are stacked:
     x = cat([event_voxel_grid, dense_frame], dim=1)."""
 
-    def __init__(self, ae, event_bins=EVENT_BINS, freeze=True):
+    def __init__(self, ae, event_bins=EVENT_BINS, freeze=True, train_fusion=False):
         super().__init__()
         self.enc_event, self.enc_dense, self.fuse = ae.enc_event, ae.enc_dense, ae.fuse
-        self.event_bins, self.freeze = event_bins, freeze
+        self.event_bins, self.freeze, self.train_fusion = event_bins, freeze, train_fusion
         self.out_channels = FEAT
-        self.down5 = nn.Conv2d(FEAT, FEAT, 3, 2, 1)   # trainable extra levels
+        # trainable extra levels. p3 (stride 8) exists so that small objects
+        # (pedestrians, distant cars) contain at least one prediction point.
+        self.up3 = nn.Sequential(nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                                 nn.Conv2d(FEAT, FEAT, 3, padding=1))
+        self.down5 = nn.Conv2d(FEAT, FEAT, 3, 2, 1)
         self.down6 = nn.Conv2d(FEAT, FEAT, 3, 2, 1)
         if freeze:
             for m in self._pretrained():
                 m.requires_grad_(False)
 
     def _pretrained(self):
+        if self.train_fusion:        # encoders frozen, fusion layers trained with the head
+            return (self.enc_event, self.enc_dense)
         return (self.enc_event, self.enc_dense, self.fuse)
 
     def train(self, mode=True):
@@ -212,20 +218,26 @@ class FusedBackbone(nn.Module):
     def forward(self, x):
         ev, dn = x[:, :self.event_bins], x[:, self.event_bins:]
         p4 = self.fuse(self.enc_event(ev), self.enc_dense(dn))       # stride 16
+        p3 = self.up3(p4)                                             # stride 8
         p5 = self.down5(F.relu(p4))                                   # stride 32
         p6 = self.down6(F.relu(p5))                                   # stride 64
-        return OrderedDict([("p4", p4), ("p5", p5), ("p6", p6)])
+        return OrderedDict([("p3", p3), ("p4", p4), ("p5", p5), ("p6", p6)])
 
 
 def build_detector(ae, num_classes=4, dense_ch=DENSE_CH, event_bins=EVENT_BINS,
-                   freeze=True, size=(512, 640)):
+                   freeze=True, size=(512, 640), score_thresh=0.05, train_fusion=False):
     """num_classes includes background: vehicle, pedestrian, bicycle -> 4,
-    with labels 1..3 in the targets. Inputs must already be normalised."""
+    with labels 1..3 in the targets. Inputs must already be normalised.
+    Anchor size = stride on every level (torchvision's FCOS convention), so FCOS
+    assigns objects up to ~64 px to p3, 64-128 px to p4, 128-256 to p5, larger to p6.
+    score_thresh: torchvision's default of 0.2 discards most detections of a
+    weakly trained head and makes mAP read ~0; 0.05 is the usual eval setting."""
     c = event_bins + dense_ch
-    anchors = AnchorGenerator(sizes=((32,), (64,), (128,)), aspect_ratios=((1.0,),) * 3)
-    return FCOS(FusedBackbone(ae, event_bins, freeze), num_classes=num_classes,
+    anchors = AnchorGenerator(sizes=((8,), (16,), (32,), (64,)), aspect_ratios=((1.0,),) * 4)
+    return FCOS(FusedBackbone(ae, event_bins, freeze, train_fusion), num_classes=num_classes,
                 anchor_generator=anchors, image_mean=[0.0] * c, image_std=[1.0] * c,
-                min_size=min(size), max_size=max(size))
+                min_size=min(size), max_size=max(size), score_thresh=score_thresh,
+                detections_per_img=100)
 
 
 class LinearProbe(nn.Module):

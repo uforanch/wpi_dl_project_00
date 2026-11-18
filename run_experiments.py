@@ -57,8 +57,6 @@ NAME_RE = re.compile(
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], np.float32)
 
-#should just be a command arg but w/e
-os.environ["HF_TOKEN"] = ""
 
 # ============================================================ cache discovery
 def parse_cache_name(fname):
@@ -202,6 +200,8 @@ def split_sequences(groups, val_frac=0.2, seed=0, cache_dir=None):
         s = sorted(by_cond[cond])
         rng.shuffle(s)
         lists.append(s)
+    if not lists:
+        return [], []
     interleaved = [s[i] for i in range(max(map(len, lists))) for s in lists if i < len(s)]
     n_val = max(1, math.ceil(val_frac * len(interleaved)))   # spread across conditions
     val = set(interleaved[:n_val])
@@ -401,10 +401,20 @@ def load_labels(args, sequences):
     return load_coco_labels(args.dataset, sequences)
 
 
+def no_cache_exit(args):
+    path = os.path.abspath(args.cache)
+    n = len(glob.glob(os.path.join(path, "*.npy")))
+    raise SystemExit(
+        f"\nNo complete event+{args.dense} cache found in:\n  {path}\n"
+        f"({'folder does not exist' if not os.path.isdir(path) else f'{n} .npy files there'})\n"
+        "Copy dsert_frames_cache/ next to run_experiments.py (or pass --cache /path/to/it),\n"
+        "or build it with `python run_experiments.py cache`.")
+
+
 def setup(args, need_labels=False):
     groups = find_groups(args.cache, args.dense)
     if not groups:
-        raise SystemExit(f"No complete event+{args.dense} groups in {args.cache}")
+        no_cache_exit(args)
     train, val = split_sequences(groups, seed=args.seed, cache_dir=args.cache)
     labels, names = (load_labels(args, sorted({g['seq'] for g in groups}))
                      if need_labels else (None, []))
@@ -510,7 +520,7 @@ def voxel_grid_fast(x, y, t, p, sensor_hw, out_hw, bins=5, H_mat=None):
 
 def _resize(a, hw, mode="bilinear"):
     from PIL import Image
-    im = Image.fromarray(np.ascontiguousarray(a, dtype=np.float32), mode="F")
+    im = Image.fromarray(np.ascontiguousarray(a, dtype=np.float32))
     return np.asarray(im.resize((hw[1], hw[0]), Image.BILINEAR), dtype=np.float32)
 
 
@@ -618,7 +628,7 @@ def warp_to_event(img, H, out_hw):
     size = (out_hw[1], out_hw[0])
 
     def one(ch):
-        im = Image.fromarray(np.ascontiguousarray(ch, np.float32), mode="F")
+        im = Image.fromarray(np.ascontiguousarray(ch, np.float32))
         return np.asarray(im.transform(size, Image.PERSPECTIVE, coeffs, Image.BILINEAR), np.float32)
     if img.ndim == 3:
         return np.stack([one(img[..., c]) for c in range(img.shape[2])], -1).clip(0, 255).astype(np.uint8)
@@ -802,14 +812,34 @@ def cmd_cache(args):
         json.dump(old, fh, indent=1)
     key = cache_key(args)
     align = not args.no_align
-    todo = [(sp, s) for sp in ("val", "train") for s in chosen[sp]]
+    def interleave(seqs):            # round-robin over weather, so a size cap
+        by_w = defaultdict(list)     # cuts every condition evenly
+        for q in seqs:
+            by_w[q.split("/")[0]].append(q)
+        lists = [by_w[w] for w in sorted(by_w)]
+        return [l[i] for i in range(max(map(len, lists), default=0)) for l in lists if i < len(l)]
+
+    # val first (so it is complete), then train, both spread across weather
+    todo = [("val", q) for q in interleave(chosen["val"])] + \
+           [("train", q) for q in interleave(chosen["train"])]
+
+    def cache_gb():
+        tot = 0
+        for root, _, files in os.walk(args.cache):
+            tot += sum(os.path.getsize(os.path.join(root, f)) for f in files)
+        return tot / 2 ** 30
     print(f"caching {len(todo)} sequences -> {args.cache} (config {key}, {Ho}x{Wo}, every "
           f"{args.frame_step}th frame, up to {args.frames_per_seq}/sequence, "
           f"{args.dense} {'aligned to event camera' if align else 'NOT aligned'})")
     for k, (sp, seq) in enumerate(todo, 1):
         P = cache_paths(args.cache, seq, key, args.dense)
         tag = f"[{k}/{len(todo)}] {seq}"
-        if all(os.path.exists(P[x]) for x in ("event", "dense", "frames", "label_pkl")):
+        done = all(os.path.exists(P[x]) for x in ("event", "dense", "frames", "label_pkl"))
+        if args.max_gb and not done and cache_gb() >= args.max_gb:
+            print(f"\nstopping: cache is {cache_gb():.2f} GB (limit --max-gb {args.max_gb}). "
+                  f"{len(todo) - k + 1} sequences not cached.")
+            break
+        if done:
             with open(P["frames"]) as fh:
                 meta = json.load(fh)
             if meta.get("dense_aligned", False) != align:          # redo dense only
@@ -900,6 +930,8 @@ def cmd_inspect(args):
     print(f"{len(all_files)} .npy files, {len(bad)} with unrecognised names")
     print(f"{len(groups)} complete event+{args.dense} groups, "
           f"{len({g['seq'] for g in groups})} sequences")
+    if not groups:
+        no_cache_exit(args)
     by_cond = defaultdict(int)
     for g in groups:
         by_cond[g["cond"]] += 1
@@ -1076,8 +1108,12 @@ def cmd_overlap(args):
         print("matplotlib not installed: skipped heatmap figures")
 
 
-@torch.no_grad() if torch else (lambda f: f)
+_no_grad = torch.no_grad() if torch else (lambda f: f)   # (Python < 3.9 compatible)
+
+
+@_no_grad
 def evaluate(det, ds, dev, num_classes, batch):
+    """-> ({class: AP50}, stats) where stats describes what the detector output."""
     det.eval()
     dets, gts = [], []
     for ev, dn, tgts in DataLoader(ds, batch, collate_fn=collate):
@@ -1086,7 +1122,26 @@ def evaluate(det, ds, dev, num_classes, batch):
             dets.append((out["boxes"].cpu().numpy(), out["scores"].cpu().numpy(),
                          out["labels"].cpu().numpy()))
             gts.append((t["boxes"].numpy(), t["labels"].numpy()))
-    return {c: average_precision(dets, gts, c) for c in range(1, num_classes)}
+    det.train()
+    n = max(len(dets), 1)
+    stats = dict(dets_per_frame=sum(len(d[1]) for d in dets) / n,
+                 mean_top_score=float(np.mean([d[1].max() if len(d[1]) else 0.0 for d in dets]))
+                 if dets else 0.0)
+    return {c: average_precision(dets, gts, c) for c in range(1, num_classes)}, stats
+
+
+def box_size_report(ds, size):
+    ws, hs = [], []
+    for g, f in ds.index:
+        lab = ds.labels[ds.groups[g]["seq"]][f]
+        b = lab["boxes"] * np.array([size[1] / lab["size"][1], size[0] / lab["size"][0]] * 2)
+        ws += list(b[:, 2] - b[:, 0])
+        hs += list(b[:, 3] - b[:, 1])
+    if not ws:
+        return "no boxes"
+    side = np.minimum(ws, hs)
+    return (f"{len(ws)} boxes at {size[0]}x{size[1]}: median {np.median(ws):.0f}x{np.median(hs):.0f} px, "
+            f"shorter side <16 px: {np.mean(side < 16):.0%}, <8 px: {np.mean(side < 8):.0%}")
 
 
 def cmd_probe(args):
@@ -1100,6 +1155,17 @@ def cmd_probe(args):
     ce, cd = channels(tr)
     ncls = len(names) + 1
     print(f"probe: {len(tr)} labelled train frames, {len(va_sub)} val frames, classes {names}")
+    print("train", box_size_report(tr, args.size))
+    old_csv = os.path.join(args.out, "probe.csv")
+    if os.path.exists(old_csv):
+        with open(old_csv) as fh:
+            header = fh.readline()
+        if "train_mAP50" not in header:          # results from the old detector setup
+            os.replace(old_csv, os.path.join(args.out, "probe_old_setup.csv"))
+            print("moved previous probe.csv to probe_old_setup.csv (different detector setup)")
+    print(f"settings: score_thresh {args.score_thresh}, encoders "
+          f"{'fine-tuned' if args.finetune else 'frozen'}, fusion "
+          f"{'trained' if (args.train_fusion or args.finetune) else 'frozen'}, {args.steps} steps")
     runs = args.only or list(EXPERIMENTS)
     if "a_imagenet" not in runs and not args.only:
         runs = ["a_imagenet"] + runs
@@ -1120,8 +1186,11 @@ def cmd_probe(args):
                 ae = CrossModalAE(saved["dense_ch"], saved["event_bins"], imagenet=False)
                 ae.load_state_dict(saved["state"])
             det = build_detector(ae, num_classes=ncls, dense_ch=cd, event_bins=ce,
-                                 freeze=not args.finetune, size=args.size).to(dev)
-            sub = Subset(tr, label_subset(tr.index, frac, seed=args.seed))
+                                 freeze=not args.finetune, size=args.size,
+                                 score_thresh=args.score_thresh,
+                                 train_fusion=args.train_fusion).to(dev)
+            sub_idx = label_subset(tr.index, frac, seed=args.seed)
+            sub = Subset(tr, sub_idx)
             it = infinite(DataLoader(sub, args.batch, shuffle=True, num_workers=args.workers,
                                      collate_fn=collate, drop_last=True,
                                      persistent_workers=args.workers > 0))
@@ -1134,22 +1203,33 @@ def cmd_probe(args):
                 ev, dn, tgts = next(it)
                 x = list(torch.cat([ev, dn], 1).to(dev))
                 tg = [{k: v.to(dev) for k, v in t.items()} for t in tgts]
-                loss = sum(det(x, tg).values())
+                parts = det(x, tg)
+                loss = sum(parts.values())
                 opt.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, 10.0)
                 opt.step()
                 sched.step()
                 if step % args.log_every == 0:
+                    detail = " ".join(f"{k.replace('bbox_', '')} {v.item():.3f}"
+                                      for k, v in parts.items())
                     print(f"{name} {frac:.0%} step {step}/{args.steps} loss {loss.item():.3f} "
-                          f"({time.time() - t0:.0f}s)")
-            ap = evaluate(det, va_sub, dev, ncls, args.batch)
-            valid = [v for v in ap.values() if not math.isnan(v)]
+                          f"[{detail}] ({time.time() - t0:.0f}s)")
+            ap, st = evaluate(det, va_sub, dev, ncls, args.batch)
+            # same metric on (up to 200) TRAINING frames: if this is also ~0 the
+            # head is not learning at all; if only val is ~0 it is overfitting
+            tr_ap, _ = evaluate(det, Subset(tr, sub_idx[::max(1, len(sub_idx) // 200)]),
+                                dev, ncls, args.batch)
+            mean = lambda d: float(np.mean([v for v in d.values() if not math.isnan(v)] or [float("nan")]))
             row = dict(experiment=name, fraction=frac, train_frames=len(sub), seed=args.seed,
-                       mAP50=float(np.mean(valid)) if valid else float("nan"),
+                       mAP50=mean(ap), train_mAP50=mean(tr_ap),
+                       dets_per_frame=round(st["dets_per_frame"], 1),
+                       mean_top_score=round(st["mean_top_score"], 3),
                        **{f"AP50_{names[c - 1]}": v for c, v in ap.items()})
             write_rows(os.path.join(args.out, "probe.csv"), [row])
-            print(f"==> {name} @ {frac:.0%}: mAP50 {row['mAP50']:.3f}")
+            print(f"==> {name} @ {frac:.0%}: val mAP50 {row['mAP50']:.3f}  "
+                  f"train mAP50 {row['train_mAP50']:.3f}  "
+                  f"({row['dets_per_frame']} detections/frame, mean top score {row['mean_top_score']})")
 
 
 def cmd_plot(args):
@@ -1188,6 +1268,7 @@ def cmd_plot(args):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--hftoken", default="")
     p.add_argument("command", choices=["cache", "labels", "inspect", "overlap", "pretrain",
                                        "probe", "plot"])
     p.add_argument("--cache", default="dsert_frames_cache")
@@ -1208,6 +1289,10 @@ def main():
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--no-imagenet", action="store_true", help="pretrain from random init")
     p.add_argument("--finetune", action="store_true", help="unfreeze encoder in probe")
+    p.add_argument("--train-fusion", action="store_true",
+                   help="probe: keep encoders frozen but train the fusion layers")
+    p.add_argument("--score-thresh", type=float, default=0.05,
+                   help="probe: minimum detection score kept for evaluation")
     p.add_argument("--max-frames", type=int, default=500, help="overlap: frames to sample")
     p.add_argument("--max-val", type=int, default=1000, help="probe: val frames to score")
     p.add_argument("--n-vis", type=int, default=6, help="overlap: figures to save")
@@ -1218,7 +1303,12 @@ def main():
     c.add_argument("--all-sequences", action="store_true", help="cache the whole split")
     c.add_argument("--frame-step", type=int, default=5, help="keep every Nth frame")
     c.add_argument("--frames-per-seq", type=int, default=100)
-    c.add_argument("--cache-size", type=int, nargs=2, default=[256, 384], metavar=("H", "W"))
+    c.add_argument("--cache-size", type=int, nargs=2, default=[256, 384], metavar=("H", "W"),
+                   help="RESOLUTION frames are stored at (height width), not a storage "
+                        "limit. ~1.1 MB/frame at 256x384; doubling both sides = ~4x")
+    c.add_argument("--max-gb", type=float, default=None,
+                   help="stop caching new sequences once the cache folder reaches this "
+                        "size (it can overshoot by one sequence, ~30-40 MB)")
     c.add_argument("--event-bins", type=int, default=5)
     c.add_argument("--event-hw", type=int, nargs=2, default=None, metavar=("H", "W"),
                    help="event sensor size (default: inferred from coordinates)")
@@ -1229,6 +1319,7 @@ def main():
     c.add_argument("--no-align", action="store_true",
                    help="don't warp the dense camera into the event camera's view")
     a = p.parse_args()
+    os.environ["HF_TOKEN"] = a.hftoken
     if a.steps is None:
         a.steps = 3000 if a.command == "probe" else 5000
     if a.lr is None:

@@ -1,0 +1,5 @@
+.venv/
+.idea/
+dsert_frames_cache/
+dsert_mae.egg-info/
+results/
