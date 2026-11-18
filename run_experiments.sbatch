@@ -27,8 +27,7 @@ nvidia-smi || true
 W=$(( SLURM_CPUS_PER_TASK / 2 ))      # data-loading workers
 
 python run_experiments.py inspect
-python run_experiments.py cache
 python run_experiments.py overlap
 python run_experiments.py pretrain --workers "$W" --device cuda
-python run_experiments.py probe    --workers "$W" --device cuda
+python run_experiments.py probe    --workers "$W" --device cuda --train-fusion
 python run_experiments.py plot

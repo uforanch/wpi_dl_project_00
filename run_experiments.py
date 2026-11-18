@@ -1,34 +1,22 @@
 """
 Experiment runner for the event + dense cross-modal autoencoder on DSERT-RoLL.
-Sits next to event_dense_ae.py and dsert_stream.py.
+Sits next to event_dense_ae.py (the model) and dsert_stream.py (data access).
 
-    python run_experiments.py cache --peek            # 1. look at label.pkl + sensor formats
-    python run_experiments.py cache                   # 2. download + cache (resumable)
-    python run_experiments.py labels                  #    rebuild 2D boxes offline if needed
-    python run_experiments.py inspect                 # 3. check shapes, labels, split
+    python run_experiments.py cache --peek            # look at label.pkl + sensor formats
+    python run_experiments.py cache                   # download + cache (resumable)
+    python run_experiments.py labels                  # rebuild 2D boxes offline if needed
+    python run_experiments.py inspect                 # check shapes, labels, split, alignment
     python run_experiments.py overlap                 # heatmap-box overlap (no training)
     python run_experiments.py pretrain                # every entry in EXPERIMENTS
-    python run_experiments.py pretrain --only b_plain c_ego
-    python run_experiments.py probe                   # detector at 10/25/50/100 % labels
+    python run_experiments.py probe --train-fusion    # detector at 10/25/50/100 % labels
     python run_experiments.py plot                    # label-efficiency curve + 2x2 table
 
-Common options: --cache dsert_frames_cache --dense thermal|rgb
-                --size 256 384 --device cuda --out results
-Cache options:  --per-weather 4 2  --frame-step 5  --frames-per-seq 100
-                --cache-size 256 384  --box-camera event_l
-
-ASSUMPTIONS (check them with `inspect`; each is isolated in one function):
-  1. Cache file names:  <Condition>__<YYYY_MM_DD_HH_MM_SS>__<rgb|thermal|event>_l__<hash>.npy
-     Each file holds every frame of that sequence for that modality, in the same
-     frame order across modalities. Files sharing (sequence, hash) belong together.
-  2. Arrays are (N,H,W), (N,H,W,C) or (N,C,H,W). Events are already an image-like
-     representation (e.g. voxel grid); the number of event channels is read from data.
-  3. Modalities in the cache are already pixel-aligned (same field of view).
-     If not, resize alone is wrong: warp with event_to_rgb_homography first.
-  4. 2D labels are COCO-format JSON somewhere under --dataset. A JSON (or its
-     image file_names) contains the sequence timestamp string; images sorted by
-     file_name line up with cached frame index. Boxes are rescaled from each
-     COCO image's width/height to --size.   -> load_coco_labels()
+Layout of this file:
+    MODEL        which model is pretrained and probed  <- swap models here
+    EXPERIMENTS  the runs and label fractions          <- add/remove runs here
+    DETECTOR     the FCOS head used by `probe`
+    data, caching, metrics and the commands follow.
+See README.md for every option.
 """
 import argparse
 import csv
@@ -39,7 +27,7 @@ import os
 import random
 import re
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 
 import numpy as np
 
@@ -56,6 +44,133 @@ NAME_RE = re.compile(
     r"(?P<mod>rgb|thermal|event)_(?P<side>[lr])__(?P<hash>[0-9a-fA-F]+)\.npy$")
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], np.float32)
+
+
+# =============================================================================
+# MODEL  -- the only place that names a specific model. To try another model,
+# change these three functions (and nothing else in this file).
+#
+# The model object returned by build_model() must provide:
+#   forward(ev, dn, hide)  -> reconstruction of the hidden modality ("event"/"dense")
+#   encode(ev, dn)         -> fused features (B, out_channels, H/16, W/16)
+#   out_channels           -> int, channels of encode()'s output
+#   fusion_modules()       -> list of sub-modules `probe --train-fusion` trains
+#                             (return [] if the model has no separate fusion part)
+# ev is the event voxel grid (B, event_bins, H, W); dn the dense frame (B, dense_ch, H, W).
+# =============================================================================
+def build_model(dense_ch, event_bins, imagenet=True):
+    """A fresh, untrained model. imagenet=True starts encoders from ImageNet."""
+    from event_dense_ae import CrossModalAE
+    return CrossModalAE(dense_ch=dense_ch, event_bins=event_bins, imagenet=imagenet)
+
+
+def train_step(model, opt, ev, dn, cfg):
+    """One pretraining step; cfg is one EXPERIMENTS entry. Returns the loss."""
+    from event_dense_ae import pretrain_step
+    return pretrain_step(model, opt, ev, dn, **cfg)
+
+
+def weight_map(ev, mode):
+    """(B,1,H,W) loss weights from events; used by `overlap` (and by train_step)."""
+    from event_dense_ae import event_weight_map
+    return event_weight_map(ev, mode)
+
+
+WEIGHT_MODES = ["none", "count", "floor", "recency", "ego"]     # compared by `overlap`
+
+
+# =============================================================================
+# EXPERIMENTS  -- every pretraining run. The dict values are passed to
+# train_step() as cfg. None = no pretraining (a baseline built in `probe`).
+# `probe` also adds the "a_imagenet" baseline (ImageNet weights, no pretraining).
+# =============================================================================
+EXPERIMENTS = {
+    # professor's three-way comparison: (a) random init, (b) plain, (c) weighted
+    "a_random_init": None,
+    "b_plain":       dict(direction="random", weight_mode="none"),
+    "c_count":       dict(direction="random", weight_mode="count"),
+    "c_floor":       dict(direction="random", weight_mode="floor"),
+    "c_recency":     dict(direction="random", weight_mode="recency"),
+    "c_ego":         dict(direction="random", weight_mode="ego"),
+    # 2x2: mask direction x weighting
+    "e2d_plain":     dict(direction="e2d", weight_mode="none"),
+    "e2d_weighted":  dict(direction="e2d", weight_mode="ego"),
+    "d2e_plain":     dict(direction="d2e", weight_mode="none"),
+    "d2e_weighted":  dict(direction="d2e", weight_mode="ego"),
+}
+LABEL_FRACTIONS = [0.10, 0.25, 0.50, 1.00]      # override with probe --fractions
+
+
+# =============================================================================
+# DETECTOR  -- FCOS head on top of model.encode(); used only by `probe`.
+# A fresh detector is built, trained and discarded for every probe run.
+# =============================================================================
+_Module = torch.nn.Module if torch else object
+
+
+class FusedBackbone(_Module):
+    """Wraps the model so torchvision FCOS can use it as a backbone.
+    FCOS takes one image tensor, so event and dense channels arrive stacked:
+    x = cat([event_voxel_grid, dense_frame], dim=1).
+    freeze=True:        model weights fixed (no gradients, BatchNorm stats fixed)
+    train_fusion=True:  ...except model.fusion_modules(), which train with the head"""
+
+    def __init__(self, model, event_bins, freeze=True, train_fusion=False):
+        super().__init__()
+        nn = torch.nn
+        self.model, self.event_bins = model, event_bins
+        self.freeze, self.train_fusion = freeze, train_fusion
+        C = self.out_channels = model.out_channels
+        # trainable extra levels. p3 (stride 8) exists so that small objects
+        # (pedestrians, distant cars) contain at least one prediction point.
+        self.up3 = nn.Sequential(nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                                 nn.Conv2d(C, C, 3, padding=1))
+        self.down5 = nn.Conv2d(C, C, 3, 2, 1)
+        self.down6 = nn.Conv2d(C, C, 3, 2, 1)
+        if freeze:
+            model.requires_grad_(False)
+            if train_fusion:
+                for m in model.fusion_modules():
+                    m.requires_grad_(True)
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze:                         # keep BatchNorm statistics frozen too
+            self.model.eval()
+            if self.train_fusion and mode:
+                for m in self.model.fusion_modules():
+                    m.train()
+        return self
+
+    def forward(self, x):
+        ev, dn = x[:, :self.event_bins], x[:, self.event_bins:]
+        p4 = self.model.encode(ev, dn)                                # stride 16
+        p3 = self.up3(p4)                                             # stride 8
+        p5 = self.down5(F.relu(p4))                                   # stride 32
+        p6 = self.down6(F.relu(p5))                                   # stride 64
+        return OrderedDict([("p3", p3), ("p4", p4), ("p5", p5), ("p6", p6)])
+
+
+def build_detector(model, num_classes, dense_ch, event_bins, size, freeze=True,
+                   train_fusion=False, score_thresh=0.05, head_convs=4):
+    """torchvision FCOS on FusedBackbone(model).
+    num_classes includes background (Bike, Pedestrian, Vehicle -> 4; labels 1..3).
+    Anchor size = stride on every level (torchvision's FCOS convention): objects
+    up to ~64 px go to p3, 64-128 to p4, 128-256 to p5, larger to p6.
+    score_thresh: torchvision's default 0.2 hides most detections of a weakly
+      trained head (mAP reads ~0); 0.05 is the usual evaluation setting.
+    head_convs: 3x3 conv layers in each head branch. 4 = standard FCOS,
+      1 = shallow probe, 0 = single conv per output (closest to a linear probe)."""
+    from torchvision.models.detection import FCOS
+    from torchvision.models.detection.fcos import FCOSHead
+    from torchvision.models.detection.anchor_utils import AnchorGenerator
+    c = event_bins + dense_ch
+    backbone = FusedBackbone(model, event_bins, freeze, train_fusion)
+    anchors = AnchorGenerator(sizes=((8,), (16,), (32,), (64,)), aspect_ratios=((1.0,),) * 4)
+    head = FCOSHead(backbone.out_channels, 1, num_classes, num_convs=head_convs)
+    return FCOS(backbone, num_classes=num_classes, anchor_generator=anchors, head=head,
+                image_mean=[0.0] * c, image_std=[1.0] * c, min_size=min(size),
+                max_size=max(size), score_thresh=score_thresh, detections_per_img=100)
 
 
 # ============================================================ cache discovery
@@ -522,19 +637,6 @@ def _resize(a, hw, mode="bilinear"):
     from PIL import Image
     im = Image.fromarray(np.ascontiguousarray(a, dtype=np.float32))
     return np.asarray(im.resize((hw[1], hw[0]), Image.BILINEAR), dtype=np.float32)
-
-
-def decode_dense(x, mod, out_hw):
-    """Decoded thermal/rgb sensor data -> (H,W) float32 thermal or (H,W,3) uint8 rgb."""
-    if isinstance(x, dict):
-        x = max((v for v in x.values() if getattr(v, "ndim", 0) >= 2), key=lambda v: v.size)
-    x = np.asarray(x)
-    if mod == "rgb":
-        return np.stack([_resize(x[..., c], out_hw) for c in range(3)], -1).clip(0, 255).astype(np.uint8)
-    x = x.astype(np.float32)
-    if x.ndim == 3:
-        x = x.mean(axis=0 if (x.shape[0] in (1, 3) and x.shape[-1] not in (1, 3)) else -1)
-    return _resize(x, out_hw)
 
 
 def _boxes_from_array(a, box_format="auto"):
@@ -1011,7 +1113,6 @@ def cmd_inspect(args):
 
 
 def cmd_pretrain(args):
-    from event_dense_ae import CrossModalAE, EXPERIMENTS, pretrain_step
     dev = pick_device(args.device)
     groups, train, _, _, _ = setup(args)
     ds = CachedPairs(groups, train, args.dense, args.size)
@@ -1029,7 +1130,7 @@ def cmd_pretrain(args):
             continue
         torch.manual_seed(args.seed)
         random.seed(args.seed)
-        ae = CrossModalAE(dense_ch=cd, event_bins=ce, imagenet=not args.no_imagenet).to(dev)
+        ae = build_model(cd, ce, imagenet=not args.no_imagenet).to(dev)
         opt = torch.optim.AdamW(ae.parameters(), lr=args.lr, weight_decay=1e-4)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.steps)
         it = infinite(DataLoader(ds, args.batch, shuffle=True, num_workers=args.workers,
@@ -1039,7 +1140,7 @@ def cmd_pretrain(args):
         t0, run = time.time(), 0.0
         for step in range(1, args.steps + 1):
             ev, dn, _ = next(it)
-            run += pretrain_step(ae, opt, ev.to(dev), dn.to(dev), **cfg)
+            run += train_step(ae, opt, ev.to(dev), dn.to(dev), cfg)
             sched.step()
             if step % args.log_every == 0:
                 write_rows(os.path.join(args.out, "pretrain_loss.csv"),
@@ -1053,12 +1154,11 @@ def cmd_pretrain(args):
 
 
 def cmd_overlap(args):
-    from event_dense_ae import event_weight_map
     _, _, val, labels, _ = setup(args, need_labels=True)
     groups = find_groups(args.cache, args.dense)
     ds = CachedPairs(groups, val, args.dense, args.size, labels, require_labels=True)
     idx = ds.index[::max(1, len(ds.index) // args.max_frames)]
-    modes = ["none", "count", "floor", "recency", "ego"]
+    modes = WEIGHT_MODES
     acc = {m: [] for m in modes}
     show = []
     for gi, f in idx:
@@ -1067,7 +1167,7 @@ def cmd_overlap(args):
             continue
         boxes = tgt["boxes"].numpy()
         for m in modes:
-            w = event_weight_map(ev[None], m)[0, 0].numpy()
+            w = weight_map(ev[None], m)[0, 0].numpy()
             r = heatmap_box_overlap(w, boxes, *args.size)
             if r:
                 acc[m].append(r)
@@ -1093,7 +1193,7 @@ def cmd_overlap(args):
             axs[0].imshow(dn[0], cmap="gray")
             axs[0].set_title(f"{args.dense} ({cond})")
             for ax, m in zip(axs[1:], modes):
-                ax.imshow(event_weight_map(ev[None], m)[0, 0], cmap="magma")
+                ax.imshow(weight_map(ev[None], m)[0, 0], cmap="magma")
                 ax.set_title(m)
             for ax in axs:
                 for x0, y0, x1, y1 in boxes:
@@ -1145,7 +1245,6 @@ def box_size_report(ds, size):
 
 
 def cmd_probe(args):
-    from event_dense_ae import CrossModalAE, EXPERIMENTS, LABEL_FRACTIONS, build_detector
     dev = pick_device(args.device)
     groups, train, val, labels, names = setup(args, need_labels=True)
     tr = CachedPairs(groups, train, args.dense, args.size, labels, require_labels=True)
@@ -1165,7 +1264,8 @@ def cmd_probe(args):
             print("moved previous probe.csv to probe_old_setup.csv (different detector setup)")
     print(f"settings: score_thresh {args.score_thresh}, encoders "
           f"{'fine-tuned' if args.finetune else 'frozen'}, fusion "
-          f"{'trained' if (args.train_fusion or args.finetune) else 'frozen'}, {args.steps} steps")
+          f"{'trained' if (args.train_fusion or args.finetune) else 'frozen'}, {args.steps} steps, "
+          f"head with {args.head_convs} conv layers per branch")
     runs = args.only or list(EXPERIMENTS)
     if "a_imagenet" not in runs and not args.only:
         runs = ["a_imagenet"] + runs
@@ -1174,21 +1274,22 @@ def cmd_probe(args):
         for frac in fracs:
             torch.manual_seed(args.seed)
             if name == "a_random_init":
-                ae = CrossModalAE(cd, ce, imagenet=False)
+                ae = build_model(cd, ce, imagenet=False)
             elif name == "a_imagenet":
-                ae = CrossModalAE(cd, ce, imagenet=True)
+                ae = build_model(cd, ce, imagenet=True)
             else:
                 ck = os.path.join(args.out, "ckpt", f"{name}.pt")
                 if not os.path.exists(ck):
                     print(f"skip {name}: no checkpoint (run pretrain first)")
                     break
                 saved = torch.load(ck, map_location="cpu")
-                ae = CrossModalAE(saved["dense_ch"], saved["event_bins"], imagenet=False)
+                ae = build_model(saved["dense_ch"], saved["event_bins"], imagenet=False)
                 ae.load_state_dict(saved["state"])
             det = build_detector(ae, num_classes=ncls, dense_ch=cd, event_bins=ce,
-                                 freeze=not args.finetune, size=args.size,
+                                 size=args.size, freeze=not args.finetune,
                                  score_thresh=args.score_thresh,
-                                 train_fusion=args.train_fusion).to(dev)
+                                 train_fusion=args.train_fusion,
+                                 head_convs=args.head_convs).to(dev)
             sub_idx = label_subset(tr.index, frac, seed=args.seed)
             sub = Subset(tr, sub_idx)
             it = infinite(DataLoader(sub, args.batch, shuffle=True, num_workers=args.workers,
@@ -1268,7 +1369,9 @@ def cmd_plot(args):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--hftoken", default="")
+    p.add_argument("--hftoken", default="",
+                   help="Hugging Face token (optional). Simpler: set the HF_TOKEN environment "
+                        "variable, which huggingface_hub reads automatically")
     p.add_argument("command", choices=["cache", "labels", "inspect", "overlap", "pretrain",
                                        "probe", "plot"])
     p.add_argument("--cache", default="dsert_frames_cache")
@@ -1291,6 +1394,8 @@ def main():
     p.add_argument("--finetune", action="store_true", help="unfreeze encoder in probe")
     p.add_argument("--train-fusion", action="store_true",
                    help="probe: keep encoders frozen but train the fusion layers")
+    p.add_argument("--head-convs", type=int, default=4,
+                   help="probe: conv layers per FCOS head branch (4 default, 1 shallow, 0 minimal)")
     p.add_argument("--score-thresh", type=float, default=0.05,
                    help="probe: minimum detection score kept for evaluation")
     p.add_argument("--max-frames", type=int, default=500, help="overlap: frames to sample")
@@ -1319,7 +1424,8 @@ def main():
     c.add_argument("--no-align", action="store_true",
                    help="don't warp the dense camera into the event camera's view")
     a = p.parse_args()
-    os.environ["HF_TOKEN"] = a.hftoken
+    if a.hftoken:                       # don't overwrite an existing HF_TOKEN with ""
+        os.environ["HF_TOKEN"] = a.hftoken
     if a.steps is None:
         a.steps = 3000 if a.command == "probe" else 5000
     if a.lr is None:
