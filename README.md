@@ -16,7 +16,8 @@ motion (ego-motion).
 | File | What it is |
 |---|---|
 | `run_experiments.py` | Everything except the model: data download/caching, the experiment list, the detector used for evaluation, metrics, plots |
-| `event_dense_ae.py` | The model only: encoders, fusion bottleneck, decoders, loss weight maps, one pretraining step |
+| `event_dense_ae.py` | The default model (`--model crossmae`): ResNet-18 encoders, fusion bottleneck, decoders, loss weight maps, one pretraining step |
+| `videomae_ae.py` | The same model with pretrained VideoMAE encoders (`--model videomae`) |
 | `dsert_stream.py` | Reads DSERT-RoLL files from Hugging Face (used by `cache`) |
 | `pyproject.toml` | Dependencies, for `pip install -e .` or `uv sync` |
 | `run_experiments.sbatch` | Example Slurm job for a GPU cluster |
@@ -254,18 +255,61 @@ prints the 2×2 direction × weighting table at the smallest label fraction.
 | `--seed` | `0` |
 | `--lr` | `3e-4` pretrain / `1e-3` probe |
 | `--log-every` | `100` |
+| `--model` | `crossmae` (or `videomae`, see below) |
 | `--hftoken` | none (or set `HF_TOKEN`) |
 
 ---
 
-## Using a different model
+## Running the experiments with VideoMAE
 
-`run_experiments.py` names the model in exactly one place, the **MODEL**
-section at the top. Everything else (pretraining loop, checkpoints, detector,
-evaluation) goes through three functions:
+`videomae_ae.py` is the same cross-modal autoencoder with one change: each
+modality's encoder is a pretrained **VideoMAE** vision transformer (ViT-Base,
+self-supervised on Kinetics-400 video, via Hugging Face `transformers`) instead
+of a ResNet-18. The fusion bottleneck, mask token, decoders, weight maps,
+experiments and detector are shared, so comparing the two isolates the encoder.
+
+```bash
+pip install -e ".[videomae]"        # adds transformers; first run downloads ~350 MB
+RES=results_videomae                # keep each model's results in its own folder
+python run_experiments.py pretrain --model videomae --out $RES --lr 1e-4
+python run_experiments.py probe    --model videomae --out $RES --train-fusion
+python run_experiments.py plot     --out $RES
+```
+
+- Each frame is repeated into a 2-frame clip (VideoMAE's patches span 2
+  frames), so every 16×16 patch becomes one token, and the tokens are reshaped
+  back into the same `(H/16, W/16)` feature map the ResNet produces.
+- Events (5 time bins) pass through a small learned 1×1 layer to make the 3
+  channels VideoMAE expects; thermal is repeated to 3 channels. That layer and
+  the 768→256 projections count as fusion layers, so `--train-fusion` trains
+  them in `probe`.
+- The `a_imagenet` baseline means "public pretrained weights, no pretraining
+  by this project": ImageNet for `crossmae`, Kinetics VideoMAE for `videomae`.
+- `--size` is fixed when the model is built: keep it equal to `--cache-size`,
+  with both numbers multiples of 32 (the default `256 384` works).
+- It is much bigger and slower than `crossmae` (~2 × 86 M parameters vs.
+  ~6 M in the encoders). Run a timed `--steps 200` test first and choose
+  `--steps` for the full run from that. A lower `--lr` (`1e-4`) is safer
+  for pretrained transformers.
+- The checkpoint records which model made it; `probe` refuses to load a
+  `crossmae` checkpoint with `--model videomae` (and vice versa).
+- To use another VideoMAE checkpoint from the Hub, change
+  `VIDEOMAE_CHECKPOINT` in `videomae_ae.py`.
+
+Quick checks: `python videomae_ae.py` (shapes, with random weights), then
+`pretrain --model videomae --steps 200 --only b_plain` and
+`probe --model videomae --steps 200 --only b_plain --fractions 1.0 --train-fusion`.
+
+---
+
+## Adding another model
+
+`run_experiments.py` names models in one place, the **MODEL** section at the
+top. Everything else (pretraining loop, checkpoints, detector, evaluation)
+goes through three functions:
 
 ```python
-def build_model(dense_ch, event_bins, imagenet=True):   # a fresh, untrained model
+def build_model(name, dense_ch, event_bins, imagenet=True, size=(256, 384)):  # fresh model
 def train_step(model, opt, ev, dn, cfg):                 # one pretraining step -> loss
 def weight_map(ev, mode):                                # used by `overlap`
 ```
@@ -282,10 +326,9 @@ The object `build_model` returns must provide:
 `ev` is the event voxel grid `(B, event_bins, H, W)` and `dn` the dense frame
 `(B, dense_ch, H, W)`. `encode` must output stride 16; for another stride,
 change the `up3`/`down5`/`down6` levels and anchor sizes in the DETECTOR
-section.
+section. `videomae_ae.py` is a complete worked example.
 
-**Example:** a variant with a deeper fusion block. Put it in its own file,
-`my_model.py`:
+**Example:** a variant with a deeper fusion block, in `my_model.py`:
 
 ```python
 import torch.nn as nn
@@ -302,25 +345,22 @@ class MyModel(CrossModalAE):
         self.fuse = DeepFusion()
 ```
 
-then change one line in `build_model`:
+Register it in `run_experiments.py`: add `"mymodel"` to `MODELS` and a branch
+to `build_model`:
 
 ```python
-def build_model(dense_ch, event_bins, imagenet=True):
-    from my_model import MyModel
-    return MyModel(dense_ch=dense_ch, event_bins=event_bins, imagenet=imagenet)
+    if name == "mymodel":
+        from my_model import MyModel
+        return MyModel(dense_ch=dense_ch, event_bins=event_bins, imagenet=imagenet)
 ```
 
-A model with a different training objective (another loss, a different masking
-scheme) also replaces `train_step`. To add or remove runs, edit `EXPERIMENTS`:
-each value is passed to `train_step` as `cfg`.
+then run with `--model mymodel`. A model with a different training objective
+(another loss, a different masking scheme) also needs its own branch in
+`train_step`. To add or remove runs, edit `EXPERIMENTS`: each value is passed
+to `train_step` as `cfg`.
 
-**Use a new `--out` folder** for a new model. Checkpoints are matched to
-experiments by name only, and `probe` would otherwise load the old model's
-weights into the new model.
-
-Check a new model quickly with `python event_dense_ae.py` (shape check for the
-default model), then `pretrain --steps 200 --only b_plain` and
-`probe --steps 200 --only b_plain --fractions 1.0`.
+Use a **separate `--out` folder per model**. Checkpoints are matched to
+experiments by name.
 
 ---
 

@@ -47,8 +47,11 @@ IMAGENET_STD = np.array([0.229, 0.224, 0.225], np.float32)
 
 
 # =============================================================================
-# MODEL  -- the only place that names a specific model. To try another model,
-# change these three functions (and nothing else in this file).
+# MODEL  -- the only place that names a specific model. Built-in choices, picked
+# with --model:  crossmae  (event_dense_ae.py, ResNet-18 encoders)
+#                videomae  (videomae_ae.py, pretrained VideoMAE encoders)
+# To add another model, add a branch to build_model() (and, if it trains
+# differently, to train_step()); nothing else in this file needs to change.
 #
 # The model object returned by build_model() must provide:
 #   forward(ev, dn, hide)  -> reconstruction of the hidden modality ("event"/"dense")
@@ -58,10 +61,20 @@ IMAGENET_STD = np.array([0.229, 0.224, 0.225], np.float32)
 #                             (return [] if the model has no separate fusion part)
 # ev is the event voxel grid (B, event_bins, H, W); dn the dense frame (B, dense_ch, H, W).
 # =============================================================================
-def build_model(dense_ch, event_bins, imagenet=True):
-    """A fresh, untrained model. imagenet=True starts encoders from ImageNet."""
-    from event_dense_ae import CrossModalAE
-    return CrossModalAE(dense_ch=dense_ch, event_bins=event_bins, imagenet=imagenet)
+MODELS = ["crossmae", "videomae"]
+
+
+def build_model(name, dense_ch, event_bins, imagenet=True, size=(256, 384)):
+    """A fresh model that has not been pretrained by this project.
+    imagenet=True starts its encoders from their public pretrained weights
+    (ImageNet for crossmae, Kinetics VideoMAE for videomae)."""
+    if name == "crossmae":
+        from event_dense_ae import CrossModalAE
+        return CrossModalAE(dense_ch=dense_ch, event_bins=event_bins, imagenet=imagenet)
+    if name == "videomae":
+        from videomae_ae import VideoMAEAE
+        return VideoMAEAE(dense_ch=dense_ch, event_bins=event_bins, imagenet=imagenet, size=size)
+    raise ValueError(f"unknown --model {name!r}; add it to build_model()")
 
 
 def train_step(model, opt, ev, dn, cfg):
@@ -1117,7 +1130,8 @@ def cmd_pretrain(args):
     groups, train, _, _, _ = setup(args)
     ds = CachedPairs(groups, train, args.dense, args.size)
     ce, cd = channels(ds)
-    print(f"pretrain on {len(ds)} frames, event ch={ce}, {args.dense} ch={cd}, device={dev}")
+    print(f"pretrain {args.model} on {len(ds)} frames, event ch={ce}, {args.dense} ch={cd}, "
+          f"device={dev}")
     names = args.only or [k for k, v in EXPERIMENTS.items() if v is not None]
     os.makedirs(os.path.join(args.out, "ckpt"), exist_ok=True)
     for name in names:
@@ -1130,7 +1144,7 @@ def cmd_pretrain(args):
             continue
         torch.manual_seed(args.seed)
         random.seed(args.seed)
-        ae = build_model(cd, ce, imagenet=not args.no_imagenet).to(dev)
+        ae = build_model(args.model, cd, ce, imagenet=not args.no_imagenet, size=args.size).to(dev)
         opt = torch.optim.AdamW(ae.parameters(), lr=args.lr, weight_decay=1e-4)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.steps)
         it = infinite(DataLoader(ds, args.batch, shuffle=True, num_workers=args.workers,
@@ -1148,7 +1162,8 @@ def cmd_pretrain(args):
                 print(f"{name} step {step}/{args.steps} loss {run / args.log_every:.4f} "
                       f"({time.time() - t0:.0f}s)")
                 run = 0.0
-        torch.save(dict(state=ae.state_dict(), event_bins=ce, dense_ch=cd, dense=args.dense,
+        torch.save(dict(state=ae.state_dict(), model=args.model, size=list(args.size),
+                        event_bins=ce, dense_ch=cd, dense=args.dense,
                         imagenet=not args.no_imagenet, cfg=cfg, steps=args.steps), ck)
         print(f"saved {ck}")
 
@@ -1262,7 +1277,7 @@ def cmd_probe(args):
         if "train_mAP50" not in header:          # results from the old detector setup
             os.replace(old_csv, os.path.join(args.out, "probe_old_setup.csv"))
             print("moved previous probe.csv to probe_old_setup.csv (different detector setup)")
-    print(f"settings: score_thresh {args.score_thresh}, encoders "
+    print(f"settings: model {args.model}, score_thresh {args.score_thresh}, encoders "
           f"{'fine-tuned' if args.finetune else 'frozen'}, fusion "
           f"{'trained' if (args.train_fusion or args.finetune) else 'frozen'}, {args.steps} steps, "
           f"head with {args.head_convs} conv layers per branch")
@@ -1274,16 +1289,21 @@ def cmd_probe(args):
         for frac in fracs:
             torch.manual_seed(args.seed)
             if name == "a_random_init":
-                ae = build_model(cd, ce, imagenet=False)
+                ae = build_model(args.model, cd, ce, imagenet=False, size=args.size)
             elif name == "a_imagenet":
-                ae = build_model(cd, ce, imagenet=True)
+                ae = build_model(args.model, cd, ce, imagenet=True, size=args.size)
             else:
                 ck = os.path.join(args.out, "ckpt", f"{name}.pt")
                 if not os.path.exists(ck):
                     print(f"skip {name}: no checkpoint (run pretrain first)")
                     break
                 saved = torch.load(ck, map_location="cpu")
-                ae = build_model(saved["dense_ch"], saved["event_bins"], imagenet=False)
+                if saved.get("model", "crossmae") != args.model:
+                    raise SystemExit(f"{ck} was pretrained with --model {saved.get('model', 'crossmae')}"
+                                     f", but probe is running --model {args.model}. Use the same "
+                                     "--model, or a different --out folder.")
+                ae = build_model(args.model, saved["dense_ch"], saved["event_bins"],
+                                 imagenet=False, size=args.size)
                 ae.load_state_dict(saved["state"])
             det = build_detector(ae, num_classes=ncls, dense_ch=cd, event_bins=ce,
                                  size=args.size, freeze=not args.finetune,
@@ -1374,6 +1394,8 @@ def main():
                         "variable, which huggingface_hub reads automatically")
     p.add_argument("command", choices=["cache", "labels", "inspect", "overlap", "pretrain",
                                        "probe", "plot"])
+    p.add_argument("--model", default="crossmae", choices=MODELS,
+                   help="model to pretrain/probe: crossmae (ResNet-18) or videomae")
     p.add_argument("--cache", default="dsert_frames_cache")
     p.add_argument("--dataset", default="dataset")
     p.add_argument("--dense", default="thermal", choices=["thermal", "rgb"])

@@ -18,8 +18,10 @@ dependencies = [
     "pillow>=8.0",
     "matplotlib>=3.3",          # inspect / overlap figures, plot
     "huggingface_hub>=0.14",    # HfFileSystem, used by the `cache` command
-    "transformers>=4.46.3",
 ]
+
+[project.optional-dependencies]
+videomae = ["transformers>=4.30"]   # pip install -e ".[videomae]"  for --model videomae
 
 [project.scripts]
 # After `pip install -e .`, run e.g. `dsert-exp inspect` instead of
@@ -28,4 +30,4 @@ dsert-exp = "run_experiments:main"
 
 [tool.setuptools]
 # Flat layout: the three scripts are top-level modules, not a package.
-py-modules = ["run_experiments", "event_dense_ae", "dsert_stream"]
+py-modules = ["run_experiments", "event_dense_ae", "videomae_ae", "dsert_stream"]
