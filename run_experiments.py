@@ -427,6 +427,24 @@ def collate(batch):
     return ev, dn, [b[2] for b in batch]
 
 
+def _worker_init(_):
+    # Data-loading workers are forked copies of the main process. If the main
+    # process already started its OpenMP thread pool (CPU interpolation in
+    # CachedPairs), a forked copy can deadlock the first time it uses it, which
+    # leaves the whole job idle. One thread per worker avoids that pool.
+    torch.set_num_threads(1)
+
+
+def train_loader(ds, args):
+    """Shuffled training loader. timeout: if no batch arrives for 10 minutes
+    (a stuck worker), raise an error instead of sitting idle on the GPU."""
+    w = args.workers
+    return DataLoader(ds, args.batch, shuffle=True, num_workers=w, collate_fn=collate,
+                      drop_last=True, persistent_workers=w > 0,
+                      worker_init_fn=_worker_init if w > 0 else None,
+                      timeout=600 if w > 0 else 0)
+
+
 def infinite(loader):
     while True:
         for b in loader:
@@ -509,12 +527,28 @@ def pick_device(name):
 
 
 def write_rows(path, rows):
+    """Append rows to a CSV. If the new rows have columns the file doesn't
+    (e.g. probe settings added later), the file is rewritten with the union
+    of columns so old and new rows stay aligned; missing cells are left empty."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    new = not os.path.exists(path)
-    with open(path, "a", newline="") as fh:
-        wr = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
-        if new:
+    keys = list(rows[0].keys())
+    if os.path.exists(path):
+        with open(path, newline="") as fh:
+            rd = csv.DictReader(fh)
+            old_keys, old_rows = list(rd.fieldnames or []), list(rd)
+        if all(k in old_keys for k in keys):
+            with open(path, "a", newline="") as fh:
+                csv.DictWriter(fh, fieldnames=old_keys, restval="").writerows(rows)
+            return
+        fields = old_keys + [k for k in keys if k not in old_keys]
+        with open(path, "w", newline="") as fh:
+            wr = csv.DictWriter(fh, fieldnames=fields, restval="")
             wr.writeheader()
+            wr.writerows(old_rows + list(rows))
+        return
+    with open(path, "w", newline="") as fh:
+        wr = csv.DictWriter(fh, fieldnames=keys)
+        wr.writeheader()
         wr.writerows(rows)
 
 
@@ -1145,27 +1179,139 @@ def cmd_pretrain(args):
         torch.manual_seed(args.seed)
         random.seed(args.seed)
         ae = build_model(args.model, cd, ce, imagenet=not args.no_imagenet, size=args.size).to(dev)
-        opt = torch.optim.AdamW(ae.parameters(), lr=args.lr, weight_decay=1e-4)
+        # --encoder-lr-scale: encoders learn at lr*scale, new layers at lr.
+        # 0 freezes the encoders completely (weights AND BatchNorm statistics),
+        # so only fusion + decoders are pretrained.
+        enc = [ae.enc_event, ae.enc_dense]
+        enc_ids = {id(p) for m in enc for p in m.parameters()}
+        rest = [p for p in ae.parameters() if id(p) not in enc_ids]
+        enc_params = [p for m in enc for p in m.parameters()]
+        if args.encoder_lr_scale == 0:
+            for m in enc:
+                m.requires_grad_(False)
+            groups_ = [dict(params=rest, lr=args.lr)]
+        else:
+            groups_ = [dict(params=rest, lr=args.lr),
+                       dict(params=enc_params, lr=args.lr * args.encoder_lr_scale)]
+        opt = torch.optim.AdamW(groups_, lr=args.lr, weight_decay=1e-4)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.steps)
-        it = infinite(DataLoader(ds, args.batch, shuffle=True, num_workers=args.workers,
-                                 collate_fn=collate, drop_last=True,
-                                 persistent_workers=args.workers > 0))
+        save_at = sorted(set(s_ for s_ in (args.save_at or []) if 0 < s_ < args.steps))
+        meta = dict(model=args.model, size=list(args.size), event_bins=ce, dense_ch=cd,
+                    dense=args.dense, imagenet=not args.no_imagenet, cfg=cfg,
+                    encoder_lr_scale=args.encoder_lr_scale)
+        print(f"{name}: encoder lr x{args.encoder_lr_scale}"
+              + (f", snapshots at steps {save_at}" if save_at else ""))
+        it = infinite(train_loader(ds, args))
         ae.train()
+        if args.encoder_lr_scale == 0:
+            for m in enc:
+                m.eval()                    # keep pretrained BatchNorm statistics
         t0, run = time.time(), 0.0
         for step in range(1, args.steps + 1):
             ev, dn, _ = next(it)
             run += train_step(ae, opt, ev.to(dev), dn.to(dev), cfg)
             sched.step()
+            if step in save_at:             # snapshot mid-schedule (lr not yet decayed)
+                snap = os.path.join(args.out, f"at_step{step}", "ckpt", f"{name}.pt")
+                os.makedirs(os.path.dirname(snap), exist_ok=True)
+                torch.save(dict(state=ae.state_dict(), steps=step, **meta), snap)
+                print(f"saved snapshot {snap}")
             if step % args.log_every == 0:
                 write_rows(os.path.join(args.out, "pretrain_loss.csv"),
                            [dict(experiment=name, step=step, loss=run / args.log_every)])
                 print(f"{name} step {step}/{args.steps} loss {run / args.log_every:.4f} "
                       f"({time.time() - t0:.0f}s)")
                 run = 0.0
-        torch.save(dict(state=ae.state_dict(), model=args.model, size=list(args.size),
-                        event_bins=ce, dense_ch=cd, dense=args.dense,
-                        imagenet=not args.no_imagenet, cfg=cfg, steps=args.steps), ck)
+        torch.save(dict(state=ae.state_dict(), steps=args.steps, **meta), ck)
         print(f"saved {ck}")
+
+
+def cmd_recon(args):
+    """How well does each pretrained checkpoint reconstruct the hidden modality
+    on VALIDATION frames? Writes <out>/recon.csv and <out>/recon_<name>.png.
+    skill = 1 - MSE(model) / MSE(predicting each frame's mean): 0 means no better
+    than a flat guess, 1 is perfect. Also reported inside/outside labelled boxes."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    dev = pick_device(args.device)
+    groups, _, val, labels, _ = setup(args, need_labels=True)
+    ds = CachedPairs(groups, val, args.dense, args.size, labels)
+    idx = list(range(len(ds)))[::max(1, len(ds) // args.max_frames)]
+    names = args.only or sorted(os.path.splitext(f)[0] for f in
+                                os.listdir(os.path.join(args.out, "ckpt")) if f.endswith(".pt"))
+    rows = []
+    for name in names:
+        ck = os.path.join(args.out, "ckpt", f"{name}.pt")
+        if not os.path.exists(ck):
+            print(f"skip {name}: no checkpoint")
+            continue
+        saved = torch.load(ck, map_location="cpu")
+        ae = build_model(saved.get("model", "crossmae"), saved["dense_ch"], saved["event_bins"],
+                         imagenet=False, size=args.size)
+        ae.load_state_dict(saved["state"])
+        ae.to(dev).eval()
+        acc = {h: defaultdict(float) for h in ("dense", "event")}
+        vis = []
+        with torch.no_grad():
+            for k in range(0, len(idx), args.batch):
+                batch = [ds[i] for i in idx[k:k + args.batch]]
+                ev, dn, tg = collate(batch)
+                ev, dn = ev.to(dev), dn.to(dev)
+                box = torch.zeros(ev.shape[0], 1, *ev.shape[2:], device=dev)
+                for j, t in enumerate(tg):
+                    for b in (t["boxes"] if t is not None else []):
+                        x0, y0, x1, y1 = [int(round(float(v))) for v in b]
+                        box[j, :, max(y0, 0):max(y1, 0), max(x0, 0):max(x1, 0)] = 1
+                for hide in ("dense", "event"):
+                    pred = ae(ev, dn, hide)
+                    tgt = dn if hide == "dense" else ev
+                    err = (pred - tgt).pow(2).mean(1, keepdim=True)
+                    flat = (tgt - tgt.mean(dim=(2, 3), keepdim=True)).pow(2).mean(1, keepdim=True)
+                    a = acc[hide]
+                    a["mse"] += err.sum().item(); a["base"] += flat.sum().item()
+                    a["n"] += err.numel()
+                    a["mse_in"] += (err * box).sum().item(); a["base_in"] += (flat * box).sum().item()
+                    a["mse_out"] += (err * (1 - box)).sum().item()
+                    a["base_out"] += (flat * (1 - box)).sum().item()
+                    if hide == "dense" and len(vis) < args.n_vis:
+                        dpred = pred.cpu()
+                        epred = ae(ev, dn, "event").cpu()
+                        for j in range(min(ev.shape[0], args.n_vis - len(vis))):
+                            vis.append((ev[j].cpu(), dn[j].cpu(), dpred[j], epred[j]))
+        for hide, a in acc.items():
+            sk = lambda m, b: 1 - a[m] / a[b] if a[b] > 0 else float("nan")
+            row = dict(experiment=name, hidden=hide, frames=len(idx),
+                       pretrain_steps=saved.get("steps"), mse=a["mse"] / max(a["n"], 1),
+                       skill=sk("mse", "base"), skill_in_boxes=sk("mse_in", "base_in"),
+                       skill_outside=sk("mse_out", "base_out"))
+            rows.append(row)
+            print(f"{name:14s} reconstruct {hide:5s}: skill {row['skill']:.3f} "
+                  f"(in boxes {row['skill_in_boxes']:.3f}, outside {row['skill_outside']:.3f})")
+        if vis:
+            fig, axs = plt.subplots(len(vis), 4, figsize=(13, 2.4 * len(vis)), squeeze=False)
+            for r, (ev, dn, dp, ep) in enumerate(vis):
+                es, eps = ev.sum(0), ep.sum(0)
+                lim = float(max(es.abs().max(), 1e-6))
+                panels = [(dn[0], "thermal (target)", "gray", None),
+                          (dp[0], "thermal from events", "gray", None),
+                          (es, "events (target)", "seismic", lim),
+                          (eps, "events from thermal", "seismic", lim)]
+                for c, (img, title, cmap, l) in enumerate(panels):
+                    kw = dict(vmin=-l, vmax=l) if l else dict(vmin=float(dn[0].min()),
+                                                               vmax=float(dn[0].max()))
+                    axs[r, c].imshow(img.numpy(), cmap=cmap, **kw)
+                    axs[r, c].set_axis_off()
+                    if r == 0:
+                        axs[r, c].set_title(title, fontsize=9)
+            fig.suptitle(f"{name}: validation reconstructions", fontsize=10)
+            fig.tight_layout()
+            png = os.path.join(args.out, f"recon_{name}.png")
+            fig.savefig(png, dpi=90)
+            plt.close(fig)
+            print(f"  figure: {png}")
+    if rows:
+        write_rows(os.path.join(args.out, "recon.csv"), rows)
 
 
 def cmd_overlap(args):
@@ -1280,7 +1426,8 @@ def cmd_probe(args):
     print(f"settings: model {args.model}, score_thresh {args.score_thresh}, encoders "
           f"{'fine-tuned' if args.finetune else 'frozen'}, fusion "
           f"{'trained' if (args.train_fusion or args.finetune) else 'frozen'}, {args.steps} steps, "
-          f"head with {args.head_convs} conv layers per branch")
+          f"head with {args.head_convs} conv layers per branch, lr {args.lr}, "
+          f"warmup {args.warmup} steps, grad clip {args.clip}, batch {args.batch}")
     runs = args.only or list(EXPERIMENTS)
     if "a_imagenet" not in runs and not args.only:
         runs = ["a_imagenet"] + runs
@@ -1312,41 +1459,61 @@ def cmd_probe(args):
                                  head_convs=args.head_convs).to(dev)
             sub_idx = label_subset(tr.index, frac, seed=args.seed)
             sub = Subset(tr, sub_idx)
-            it = infinite(DataLoader(sub, args.batch, shuffle=True, num_workers=args.workers,
-                                     collate_fn=collate, drop_last=True,
-                                     persistent_workers=args.workers > 0))
+            it = infinite(train_loader(sub, args))
             params = [p for p in det.parameters() if p.requires_grad]
             opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=1e-4)
-            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.steps)
+            # linear warmup over --warmup steps, then cosine decay to 0.
+            # With --warmup 0 this is identical to the old CosineAnnealingLR.
+            wu, total = args.warmup, args.steps
+            sched = torch.optim.lr_scheduler.LambdaLR(
+                opt, lambda s: (s + 1) / wu if s < wu else
+                0.5 * (1 + math.cos(math.pi * (s - wu) / max(1, total - wu))))
             det.train()
             t0 = time.time()
+            diverged = None
             for step in range(1, args.steps + 1):          # same budget for every run
                 ev, dn, tgts = next(it)
                 x = list(torch.cat([ev, dn], 1).to(dev))
                 tg = [{k: v.to(dev) for k, v in t.items()} for t in tgts]
                 parts = det(x, tg)
                 loss = sum(parts.values())
+                if not torch.isfinite(loss):               # NaN/inf: weights would be ruined
+                    diverged = step
+                    detail = " ".join(f"{k.replace('bbox_', '')} {v.item():.3f}"
+                                      for k, v in parts.items())
+                    print(f"{name} {frac:.0%} step {step}/{args.steps} loss {loss.item()} "
+                          f"[{detail}] DIVERGED: stopping this run")
+                    break
                 opt.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(params, 10.0)
+                torch.nn.utils.clip_grad_norm_(params, args.clip)
                 opt.step()
                 sched.step()
-                if step % args.log_every == 0:
+                if step == 1 or step % args.log_every == 0:
                     detail = " ".join(f"{k.replace('bbox_', '')} {v.item():.3f}"
                                       for k, v in parts.items())
                     print(f"{name} {frac:.0%} step {step}/{args.steps} loss {loss.item():.3f} "
                           f"[{detail}] ({time.time() - t0:.0f}s)")
-            ap, st = evaluate(det, va_sub, dev, ncls, args.batch)
-            # same metric on (up to 200) TRAINING frames: if this is also ~0 the
-            # head is not learning at all; if only val is ~0 it is overfitting
-            tr_ap, _ = evaluate(det, Subset(tr, sub_idx[::max(1, len(sub_idx) // 200)]),
-                                dev, ncls, args.batch)
+            settings = dict(lr=args.lr, warmup=args.warmup, clip=args.clip, batch=args.batch,
+                            steps=args.steps, head_convs=args.head_convs,
+                            train_fusion=int(bool(args.train_fusion or args.finetune)),
+                            diverged_step=diverged if diverged else "")
+            if diverged:   # nothing meaningful to evaluate: record zeros, as before
+                ap = {c: 0.0 for c in range(1, ncls)}
+                tr_ap = dict(ap)
+                st = dict(dets_per_frame=0.0, mean_top_score=0.0)
+            else:
+                ap, st = evaluate(det, va_sub, dev, ncls, args.batch)
+                # same metric on (up to 200) TRAINING frames: if this is also ~0 the
+                # head is not learning at all; if only val is ~0 it is overfitting
+                tr_ap, _ = evaluate(det, Subset(tr, sub_idx[::max(1, len(sub_idx) // 200)]),
+                                    dev, ncls, args.batch)
             mean = lambda d: float(np.mean([v for v in d.values() if not math.isnan(v)] or [float("nan")]))
             row = dict(experiment=name, fraction=frac, train_frames=len(sub), seed=args.seed,
                        mAP50=mean(ap), train_mAP50=mean(tr_ap),
                        dets_per_frame=round(st["dets_per_frame"], 1),
                        mean_top_score=round(st["mean_top_score"], 3),
-                       **{f"AP50_{names[c - 1]}": v for c, v in ap.items()})
+                       **{f"AP50_{names[c - 1]}": v for c, v in ap.items()}, **settings)
             write_rows(os.path.join(args.out, "probe.csv"), [row])
             print(f"==> {name} @ {frac:.0%}: val mAP50 {row['mAP50']:.3f}  "
                   f"train mAP50 {row['train_mAP50']:.3f}  "
@@ -1393,7 +1560,7 @@ def main():
                    help="Hugging Face token (optional). Simpler: set the HF_TOKEN environment "
                         "variable, which huggingface_hub reads automatically")
     p.add_argument("command", choices=["cache", "labels", "inspect", "overlap", "pretrain",
-                                       "probe", "plot"])
+                                       "probe", "plot", "recon"])
     p.add_argument("--model", default="crossmae", choices=MODELS,
                    help="model to pretrain/probe: crossmae (ResNet-18) or videomae")
     p.add_argument("--cache", default="dsert_frames_cache")
@@ -1418,6 +1585,14 @@ def main():
                    help="probe: keep encoders frozen but train the fusion layers")
     p.add_argument("--head-convs", type=int, default=4,
                    help="probe: conv layers per FCOS head branch (4 default, 1 shallow, 0 minimal)")
+    p.add_argument("--encoder-lr-scale", type=float, default=1.0,
+                   help="pretrain: encoder lr = lr x this (0 = encoders frozen, incl. BatchNorm)")
+    p.add_argument("--save-at", type=int, nargs="*", default=None,
+                   help="pretrain: also save snapshots at these steps, to <out>/at_step<N>/ckpt/")
+    p.add_argument("--warmup", type=int, default=0,
+                   help="probe: linear learning-rate warmup steps before the cosine decay")
+    p.add_argument("--clip", type=float, default=10.0,
+                   help="probe: max gradient norm (lower = gentler updates)")
     p.add_argument("--score-thresh", type=float, default=0.05,
                    help="probe: minimum detection score kept for evaluation")
     p.add_argument("--max-frames", type=int, default=500, help="overlap: frames to sample")
@@ -1455,7 +1630,7 @@ def main():
     a.size = tuple(a.size)
     a.cache_size = list(a.cache_size)
     dict(cache=cmd_cache, labels=cmd_labels, inspect=cmd_inspect, overlap=cmd_overlap, pretrain=cmd_pretrain,
-         probe=cmd_probe, plot=cmd_plot)[a.command](a)
+         probe=cmd_probe, plot=cmd_plot, recon=cmd_recon)[a.command](a)
 
 
 if __name__ == "__main__":

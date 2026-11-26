@@ -18,6 +18,8 @@ dependencies = [
     "pillow>=8.0",
     "matplotlib>=3.3",          # inspect / overlap figures, plot
     "huggingface_hub>=0.14",    # HfFileSystem, used by the `cache` command
+    "jupyter>=1.1.1",
+    "pandas>=2.0.3",
 ]
 
 [project.optional-dependencies]

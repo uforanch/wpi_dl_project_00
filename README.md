@@ -21,6 +21,15 @@ motion (ego-motion).
 | `dsert_stream.py` | Reads DSERT-RoLL files from Hugging Face (used by `cache`) |
 | `pyproject.toml` | Dependencies, for `pip install -e .` or `uv sync` |
 | `run_experiments.sbatch` | Example Slurm job for a GPU cluster |
+| `stab_common.sh`, `stab*.sbatch` | Slurm jobs for fixing probe instability, one per step (see below) |
+| `s3_submit.sh`, `s3_pretrain.sbatch` | Jobs testing why pretraining lowers detection scores (see below) |
+| `s4_submit.sh` | Mask direction × weighting (e2d/d2e × plain/weighted) at 1× and 0.1× encoder learning rate |
+| `s5_submit.sh` | Extra pretraining seeds for the direction result, the other weighting variants, and the label-efficiency curve |
+| `plot_curve.py` | Label-efficiency figure (mean ± std over seeds) from several probe folders |
+| `s6_submit.sh` | 7 more probe seeds for `a_imagenet` and `e2d_weighted` at 10 % and 25 % labels, to test the low-label advantage |
+| `s7_submit.sh` | Final check: the 10 %-label test for the other two `e2d_weighted` pretraining runs |
+| `final.sbatch`, `final_submit.sh` | One final run per model with the best settings: pretrain `e2d_weighted` (0.1× encoders), probe vs `a_imagenet` / `a_random_init` at 10–100 % labels, recon, plot |
+| `probe_report.py` | Summarises probe runs: collapse rate, mean ± std, loss behaviour, paired differences |
 
 All files go in the same folder.
 
@@ -206,6 +215,8 @@ use `--overwrite`, or a new `--out` folder, after changing the data.
 | `--only NAME ...` | run only these experiments |
 | `--overwrite` | retrain even if a checkpoint exists |
 | `--no-imagenet` | start encoders from random weights instead of ImageNet |
+| `--encoder-lr-scale S` | encoders learn at `lr × S`, new layers at `lr` (default 1). `0` freezes the encoders, including their BatchNorm statistics |
+| `--save-at N ...` | also save snapshots at these steps to `<out>/at_step<N>/ckpt/`, which `probe` and `recon` can use as an `--out` folder |
 
 Pretraining losses from different weight modes are not comparable with each
 other (each weights pixels differently).
@@ -220,21 +231,37 @@ other (each weights pixels differently).
 | `--steps` | `3000` | training steps per detector, identical for every run |
 | `--fractions F ...` | `0.1 0.25 0.5 1.0` | label fractions to run, e.g. `--fractions 0.5` |
 | `--only NAME ...` | all | experiments to probe (baselines included by name) |
+| `--lr` | `1e-3` | AdamW learning rate of the detector |
+| `--warmup` | `0` | steps of linear learning-rate warmup before the cosine decay (`0` = old behaviour) |
+| `--clip` | `10` | maximum gradient norm; lower values make updates gentler |
 | `--score-thresh` | `0.05` | minimum detection confidence kept for scoring |
 | `--max-val` | `1000` | maximum validation frames scored |
 
 Each run prints validation **and** training-frame mAP, detections per frame and
-mean top score. Training mAP near zero means the detector is not learning;
+mean top score. If the loss becomes NaN or infinite the run stops, is
+recorded with zeros and its `diverged_step` column says at which step.
+Training mAP near zero means the detector is not learning;
 high training mAP with near-zero validation mAP means overfitting (too little
 data).
 
 Label subsets are blocks of consecutive frames, nested (the 10 % subset is
 inside the 25 % one) and identical across runs with the same `--seed`.
 
-**`probe.csv` does not record `--head-convs`, `--steps` or `--train-fusion`.**
-Use a separate `--out` folder for each combination, or results get mixed.
+`probe.csv` records each run's `lr`, `warmup`, `clip`, `batch`, `steps`,
+`head_convs` and `train_fusion` (rows written before these columns existed
+have them empty). Still use a separate `--out` folder for each combination:
+`plot` does not split results by these settings.
 Re-running `probe` appends rows rather than skipping finished runs; use
 `--only` and `--fractions` to resume, and delete partial rows first.
+
+### `recon`
+
+Checks how well each checkpoint in `<out>/ckpt/` reconstructs the hidden
+modality on validation frames, in both directions. Writes `<out>/recon.csv` and
+`<out>/recon_<name>.png` (thermal and events: target vs. reconstruction).
+`skill = 1 − MSE(model) / MSE(predicting each frame's mean)`: 0 means no better
+than a flat guess, 1 is perfect; also given inside and outside labelled boxes.
+Uses `--max-frames` (frames scored), `--n-vis` (rows in the figure), `--only`.
 
 ### `plot`
 
@@ -400,6 +427,77 @@ or restart the session.
 `dsert_frames_cache/` to the cluster (compute nodes often have no internet),
 and edit the environment lines and, if needed, the GPU partition. Then
 `sbatch run_experiments.sbatch` and follow `slurm-<jobid>.out`.
+
+### Probe-stability scripts
+
+Some probe runs collapse (the detector never learns or its loss goes NaN), so
+single runs can't be compared. These jobs test fixes on a small, fixed test
+bed (default: `a_imagenet b_plain c_ego` at 100 % labels, seeds `0 1 2`), each
+setting in its own folder under `dsert_stability/<model>/`, reusing existing
+checkpoints through a link (no pretraining). Settings are in
+`stab_common.sh`; override any of them at submission:
+
+```bash
+sbatch --export=ALL,MODEL=videomae stab1_baseline.sbatch
+sbatch --export=ALL,MODEL=videomae,SEEDS="0 1 2 3" stab3_lr.sbatch
+```
+
+| Job | Step | Tests |
+|---|---|---|
+| `stab1_baseline.sbatch` | 1–2 | current settings with detailed loss logs: how do runs fail? |
+| `stab3_lr.sbatch` | 3 | `--lr 3e-4`, `--lr 1e-4` |
+| `stab4_warmup_clip.sbatch` | 4 | `--warmup 200`, `--clip 1`, both (`LR4=` sets the lr) |
+| `stab5_fusion_batch.sbatch` | 5 | `--batch 16`; fusion frozen (`STAB_FLAGS=` adds the step 3–4 winners) |
+| `stab6_steps.sbatch` | 6 | chosen settings (`BEST=`) at 1000 vs 3000 steps, 10 % and 100 % |
+| `stab7_final.sbatch` | 7 | chosen settings on 5 GB and 20 GB checkpoints, same cache, seeds 0–4 |
+| `stab_quick.sbatch` | any | one setting (`TAG=`, `FLAGS=`) in a short job, for running settings or seeds in parallel; folders ending `_seedN` are merged by the report |
+
+Each job ends by running `probe_report.py`; run it again any time:
+
+```bash
+python probe_report.py dsert_stability/videomae --logs slurm-*.out --md report.md
+```
+
+`stab_quick.sbatch` runs one setting (`TAG=`, `FLAGS=`) as a short job.
+
+**Why does pretraining hurt?** `bash s3_submit.sh` (or `MODEL=videomae bash
+s3_submit.sh`) submits three pretraining jobs (`s3_pretrain.sbatch`): normal
+pretraining with snapshots at 250/500/1000 steps, encoders at 0.1× learning
+rate, and frozen encoders. Each ends with `recon`. Six probe jobs start
+automatically when their pretraining job succeeds. The script prints the report
+command to run at the end.
+
+**Mask direction × weighting.** `bash s4_submit.sh` pretrains `e2d_plain`
+`e2d_weighted` and `d2e_plain` `d2e_weighted`, each at 1× and 0.1× encoder
+learning rate (4 pretraining jobs, each followed automatically by a probe job).
+Checkpoints go to `dsert_results/s4_<model>_<dir>_<full|enc0.1>/`, probe
+results to `dsert_stability/<model>/s4_<dir>_<full|enc0.1>/`. `DIRS=e2d` runs
+only one direction; `WORKERS=0` turns off data-loading workers. In `recon.csv`,
+only the trained direction means anything (e2d: `hidden=dense`; d2e:
+`hidden=event`); the other decoder was never trained.
+
+**Stage s5.** `bash s5_submit.sh` (choose parts with `PARTS="seeds weights
+curve"`) runs, all at 0.1× encoder learning rate with the fixed probe:
+`seeds`: `e2d_weighted`, `d2e_weighted`, `c_ego` pretrained with `--seed 1` and
+`2`; `weights`: `c_count`, `c_floor`, `c_recency`; `curve`: 10/25/50/100 % labels
+for `a_random_init`, `a_imagenet`, `b_plain`, `c_ego`, `e2d_weighted`. It prints
+the report commands. `probe_report.py --merge NAME` combines folders (e.g.
+different pretraining seeds) into one setting; `--ref-from DIR` takes only the
+`--paired` reference runs from DIR.
+
+**Stage s6.** `bash s6_submit.sh` adds probe seeds 3–9 for `a_imagenet` and
+`e2d_weighted` at 10 % and 25 % labels (no pretraining, no data-loading
+workers). The paired table in `probe_report.py` now also gives a two-sided sign
+test (`p (mAP)`, `p (Vehicle)`) on the seed-matched pairs.
+
+**Stage s7.** `bash s7_submit.sh` probes `e2d_weighted` from the two extra
+pretraining runs (`s5_<model>_pseed1`, `_pseed2`) at 10 % labels with probe seeds
+0–9, in folders `s7_pseed<P>_seed0` / `_seed5` (two halves of one setting). The
+printed report command pairs them with the `a_imagenet` runs of the same seeds.
+
+A finished (setting, seed) is marked with a `.done_*` file, so resubmitting a
+job after a timeout skips it. A seed interrupted half-way is rerun from the
+start, which can leave duplicate rows in that folder's `probe.csv`.
 
 ---
 
